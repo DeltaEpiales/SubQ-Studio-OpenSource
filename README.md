@@ -9,7 +9,7 @@ The studio has been fully refactored for production-grade throughput!
 - **Subword BPE Tokenization**: Replaced character-level looping with OpenAI's `tiktoken` (`cl100k_base`), dramatically improving context packing.
 - **Vectorized CUDA Attention**: The pure Python `for`-loop bottleneck in the attention router has been completely eradicated using batched `torch.gather` and Tensor Core operations.
 - **PyTorch 2.0+ Compilation**: Integrated `torch.compile` (`_inductor` backend) for deep kernel-level graph optimization (automatically bypasses Windows Triton limitations).
-- **AMP & CPU Offloading**: Fully integrated Automatic Mixed Precision (FP16/FP32 scaling) paired with Optimizer RAM offloading to maximize RTX 4070 VRAM availability.
+- **AMP & Gradient Checkpointing**: Fully integrated Automatic Mixed Precision (FP16/BF16 scaling) paired with Gradient Checkpointing to maximize RTX 4070 VRAM availability.
 - **Sample-Level Loss Aggregation**: Stabilized long-context gradient dominance by computing loss per-document before batch averaging.
 
 ## Components
@@ -25,7 +25,7 @@ A local training and active inference studio for the SubQ architecture.
 - **Subquadratic Sparse Attention**: Employs content-dependent block-level routing for near-linear compute scaling at long contexts.
 - **Rotary Positional Embeddings (RoPE)**: Replaces traditional absolute position embeddings, allowing the model to smoothly extrapolate and generate beyond its training sequence length.
 - **Sample-Level Loss Aggregation**: Stabilizes gradient updates across packed long-context examples by averaging loss over the time dimension.
-- **Hardware Optimized**: Features a streaming PyTorch `DataLoader` with host RAM optimizer offloading, allowing you to train multi-million parameter models on standard 12GB VRAM GPUs without OOM errors.
+- **Hardware Optimized**: Features a truly streaming PyTorch `IterableDataset` with KV-caching and gradient checkpointing, allowing you to train and infer multi-million parameter models on standard 12GB VRAM GPUs without OOM errors.
 
 ## Installation
 

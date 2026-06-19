@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, IterableDataset, DataLoader
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 import tiktoken
@@ -52,38 +52,43 @@ tokenizer = BPETokenizer()
 # ==========================================
 # 2. STREAMING DATASET HANDLER
 # ==========================================
-class ScientificTextDataset(Dataset):
+class ScientificTextDataset(IterableDataset):
     """
     Reads large text files dynamically without exploding System RAM.
-    Streams concatenated text chunks from the data directory. The sequence 
-    length determines the context window size during training.
+    Streams concatenated text chunks from the data directory.
     """
-    def __init__(self, data_dir, seq_length=64, device='cpu'):
+    def __init__(self, data_dir, seq_length=64):
+        super().__init__()
         self.seq_length = seq_length
         self.files = glob.glob(os.path.join(data_dir, "*.txt"))
-        self.tokens = []
         
-        # Load tokens sequentially into a single flat list
+        # Estimate total samples for progress bars and schedulers
+        total_bytes = sum(os.path.getsize(f) for f in self.files)
+        estimated_tokens = total_bytes // 4
+        self.estimated_samples = max(1, estimated_tokens // seq_length)
+
+    def __len__(self):
+        return self.estimated_samples
+
+    def __iter__(self):
+        buffer = []
         for file in self.files:
             try:
                 with open(file, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                    self.tokens.extend(tokenizer.encode(text))
+                    while True:
+                        lines = f.readlines(1024 * 1024) # ~1MB chunk
+                        if not lines:
+                            break
+                        text = "".join(lines)
+                        buffer.extend(tokenizer.encode(text))
+                        
+                        while len(buffer) > self.seq_length:
+                            x = buffer[:self.seq_length]
+                            y = buffer[1:self.seq_length + 1]
+                            yield torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+                            buffer = buffer[self.seq_length:] # Non-overlapping stride
             except Exception as e:
-                print(f"Skipping {file} due to error: {e}")
-
-        # Store as a single contiguous tensor to save memory (much more efficient than a list of tuples)
-        # Pre-loading directly to the specified device (GPU) eliminates Host-to-Device transfer bottlenecks.
-        self.tokens = torch.tensor(self.tokens, dtype=torch.long, device=device)
-        self.num_samples = max(0, len(self.tokens) - seq_length)
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        x = self.tokens[idx : idx + self.seq_length]
-        y = self.tokens[idx + 1 : idx + self.seq_length + 1]
-        return x, y
+                pass
 
 # ==========================================
 # 3. SUBQ ARCHITECTURE (TENSOR CORE READY)
@@ -104,9 +109,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer('cos_cached', freqs.cos())
         self.register_buffer('sin_cached', freqs.sin())
 
-    def forward(self, q, k, seq_len):
-        cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(1) # [1, 1, seq_len, dim/2]
-        sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(1)
+    def forward(self, q, k, seq_len, offset=0):
+        cos = self.cos_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(1) # [1, 1, seq_len, dim/2]
+        sin = self.sin_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
         
         def apply_rotary(x):
             x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
@@ -136,22 +141,42 @@ class SubquadraticSparseAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.rope = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x):
+    def forward(self, x, past_key_value=None, use_cache=False):
         batch_size, seq_len, embed_dim = x.size()
+        
+        Q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        K = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        V = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+        offset = 0
+        if past_key_value is not None:
+            offset = past_key_value[0].size(2)
+            
+        Q, K = self.rope(Q, K, seq_len, offset=offset)
+        
+        if past_key_value is not None:
+            K = torch.cat([past_key_value[0], K], dim=2)
+            V = torch.cat([past_key_value[1], V], dim=2)
+            
+        new_past = (K, V) if use_cache else None
+
+        if seq_len == 1 and past_key_value is not None:
+            # Fast path for single-token autoregressive generation
+            attn_weights = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            attn_probs = F.softmax(attn_weights, dim=-1)
+            out = torch.matmul(attn_probs, V)
+            out = out.transpose(1, 2).contiguous().view(batch_size, 1, embed_dim)
+            return self.out_proj(out), new_past
+            
         pad_len = (self.block_size - (seq_len % self.block_size)) % self.block_size
-        if pad_len > 0: x = F.pad(x, (0, 0, 0, pad_len))
+        if pad_len > 0: 
+            Q = F.pad(Q, (0, 0, 0, pad_len))
+            K = F.pad(K, (0, 0, 0, pad_len))
+            V = F.pad(V, (0, 0, 0, pad_len))
         seq_len_padded = seq_len + pad_len
             
         num_blocks = seq_len_padded // self.block_size
         
-        # Q, K, V: [B, seq_len_padded, H, D] -> [B, H, seq_len_padded, D]
-        Q = self.q_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        K = self.k_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        V = self.v_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-        # Apply RoPE
-        Q, K = self.rope(Q, K, seq_len_padded)
-
         # Blocked: [B, H, M, B_size, D]
         Q_blocked = Q.view(batch_size, self.num_heads, num_blocks, self.block_size, self.head_dim)
         K_blocked = K.view(batch_size, self.num_heads, num_blocks, self.block_size, self.head_dim)
@@ -172,8 +197,6 @@ class SubquadraticSparseAttention(nn.Module):
         
         actual_top_k = min(self.top_k_blocks, num_blocks)
         _, top_k_indices = torch.topk(routing_scores, actual_top_k, dim=-1) # [B, H, M, K_blocks]
-        
-        out = torch.zeros_like(Q_blocked) # [B, H, M, B_size, D]
         
         # Fully Vectorized Sparse Block Attention
         BH = batch_size * self.num_heads
@@ -208,13 +231,13 @@ class SubquadraticSparseAttention(nn.Module):
 
         out = out.view(batch_size, self.num_heads, seq_len_padded, self.head_dim).transpose(1, 2).contiguous().view(batch_size, seq_len_padded, embed_dim)
         if pad_len > 0: out = out[:, :-pad_len, :]
-        return self.out_proj(out)
+        return self.out_proj(out), new_past
 
 class SubQVariantModel(nn.Module):
     """
-    The main language model combining character embeddings, multiple layers 
-    of Subquadratic Sparse Attention, and LayerNorms. Uses a character-level 
-    tokenizer designed to process math and physics equations seamlessly.
+    The main language model combining subword embeddings, multiple layers 
+    of Subquadratic Sparse Attention, and LayerNorms. Uses OpenAI's tiktoken 
+    (cl100k_base) BPE tokenizer for optimal context packing.
     """
     def __init__(self, vocab_size, embed_dim=256, depth=6, num_heads=8, max_seq_len=2048):
         super().__init__()
@@ -228,20 +251,46 @@ class SubQVariantModel(nn.Module):
             }) for _ in range(depth)
         ])
         self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.use_checkpointing = False
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, past_key_values=None, use_cache=False):
         x = self.embedding(input_ids)
-        for layer in self.layers:
-            x = x + layer["attn"](layer["ln_1"](x))
-            x = x + layer["mlp"](layer["ln_2"](x))
+        if getattr(self, 'use_checkpointing', False) and self.training:
+            x.requires_grad_(True)
+            
+        new_past_key_values = () if use_cache else None
+            
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            
+            if getattr(self, 'use_checkpointing', False) and self.training:
+                def layer_forward(x_in, l=layer):
+                    attn_out, _ = l["attn"](l["ln_1"](x_in))
+                    out = x_in + attn_out
+                    return out + l["mlp"](l["ln_2"](out))
+                x = torch.utils.checkpoint.checkpoint(layer_forward, x, use_reentrant=False)
+            else:
+                attn_out, new_past = layer["attn"](layer["ln_1"](x), past_key_value=past_kv, use_cache=use_cache)
+                x = x + attn_out
+                x = x + layer["mlp"](layer["ln_2"](x))
+                if use_cache:
+                    new_past_key_values = new_past_key_values + (new_past,)
+                    
+        if use_cache:
+            return self.lm_head(x), new_past_key_values
         return self.lm_head(x)
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None, max_seq_len=2048):
         self.eval()
+        past_key_values = None
         for _ in range(max_new_tokens):
-            idx_cond = input_ids if input_ids.size(1) <= max_seq_len else input_ids[:, -max_seq_len:]
-            logits = self(idx_cond)
+            if past_key_values is None:
+                idx_cond = input_ids if input_ids.size(1) <= max_seq_len else input_ids[:, -max_seq_len:]
+            else:
+                idx_cond = input_ids[:, -1:]
+                
+            logits, past_key_values = self(idx_cond, past_key_values=past_key_values, use_cache=True)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -399,7 +448,7 @@ class SubQStudioApp:
         ttk.Checkbutton(cfg_box, text="Enable Mixed Precision (Leverages RTX 4070 Tensor Cores / BF16)", variable=self.use_amp_var).grid(row=0, column=0, sticky="w", pady=2)
         
         self.ram_overflow_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(cfg_box, text="Asynchronous Optimizer Offload (32GB Host RAM)", variable=self.ram_overflow_var).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(cfg_box, text="Gradient Checkpointing (Save VRAM via Recomputation)", variable=self.ram_overflow_var).grid(row=1, column=0, sticky="w", pady=2)
         
         self.delta_train_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(cfg_box, text="Freeze Base Topologies (Halt Hallucinations)", variable=self.delta_train_var).grid(row=2, column=0, sticky="w", pady=2)
@@ -442,22 +491,20 @@ class SubQStudioApp:
         self.best_loss = float('inf')
         
         # 1. Prepare Streaming Dataset
-        # Pre-load entire dataset directly into VRAM for zero-latency batch generation
-        # This completely eliminates CPU->GPU transfer bottlenecks.
-        dataset = ScientificTextDataset(self.data_dir, seq_length=512, device=self.gpu_device)
+        # Keep dataset in CPU RAM and stream to GPU during the training loop.
+        dataset = ScientificTextDataset(self.data_dir, seq_length=512)
         if len(dataset) == 0:
             self.log(self.train_log, "[Error] Database empty. Cannot initialize DataLoader.")
             self.btn_train.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
             return
 
-        # DataLoader configured for GPU Starvation Prevention
-        # With dataset already in VRAM, pin_memory and num_workers are unnecessary.
+        # DataLoader configured to stream batches to GPU
         dataloader = DataLoader(
             dataset, 
             batch_size=self.batch_size_var.get(), 
-            shuffle=True, 
-            pin_memory=False, 
+            shuffle=False, 
+            pin_memory=True, 
             num_workers=0,
             drop_last=True
         )
@@ -470,14 +517,16 @@ class SubQStudioApp:
         
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
-        # 3. RAM Optimizer Offloading & Scaler Setup
-        use_cpu_offload = self.ram_overflow_var.get()
-        if use_cpu_offload:
-            self.log(self.train_log, "[Memory] Redirecting Optimizer state matrices to 32GB System RAM.")
-            cpu_params = [torch.nn.Parameter(p.clone().detach().cpu(), requires_grad=True) for p in trainable_params]
-            optimizer = AdamW(cpu_params, lr=1e-4)
+        # 3. VRAM Optimization & Scaler Setup
+        use_checkpointing = self.ram_overflow_var.get()
+        if use_checkpointing:
+            self.model.use_checkpointing = True
+            self.log(self.train_log, "[Memory] Gradient Checkpointing activated. Recomputing activations to save VRAM.")
         else:
-            optimizer = AdamW(trainable_params, lr=1e-4)
+            self.model.use_checkpointing = False
+            
+        # Standard GPU Optimizer
+        optimizer = AdamW(trainable_params, lr=1e-4, fused=torch.cuda.is_available())
 
         amp_enabled = self.use_amp_var.get() and torch.cuda.is_available()
         scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
@@ -506,8 +555,9 @@ class SubQStudioApp:
             for step, (x_batch, y_batch) in enumerate(dataloader):
                 if not self.is_training: break
                 
-                # Batches are already generated natively on the GPU by the VRAM-resident Dataset
-                # No host-to-device .to() transfer is needed!
+                # Stream batch to GPU asynchronously
+                x_batch = x_batch.to(self.gpu_device, non_blocking=True)
+                y_batch = y_batch.to(self.gpu_device, non_blocking=True)
                 
                 # Forward Pass (with optional Tensor Core acceleration)
                 if amp_enabled:
@@ -524,33 +574,13 @@ class SubQStudioApp:
                     scaler.scale(loss).backward()
                     
                     if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
-                        if use_cpu_offload:
-                            # 1. Copy SCALED gradients to RAM
-                            for gpu_p, cpu_p in zip(trainable_params, cpu_params):
-                                if gpu_p.grad is not None:
-                                    cpu_p.grad = gpu_p.grad.to('cpu', non_blocking=True)
-                            
-                            # 2. Unscale CPU gradients and Step using PyTorch AMP
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(cpu_params, 1.0)
-                            scaler.step(optimizer)
-                            scaler.update()
-                            scheduler.step()
-                            
-                            # 3. Copy updated weights back to GPU
-                            with torch.no_grad():
-                                for gpu_p, cpu_p in zip(trainable_params, cpu_params):
-                                    gpu_p.copy_(cpu_p.to(self.gpu_device, non_blocking=True))
-                            optimizer.zero_grad(set_to_none=True)
-                            self.model.zero_grad(set_to_none=True)
-                        else:
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                            scaler.step(optimizer)
-                            scaler.update()
-                            scheduler.step()
-                            optimizer.zero_grad(set_to_none=True)
-                            self.model.zero_grad(set_to_none=True)
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        self.model.zero_grad(set_to_none=True)
 
                 else:
                     logits = self.model(x_batch)
@@ -560,28 +590,11 @@ class SubQStudioApp:
                     loss.backward()
                     
                     if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
-                        if use_cpu_offload:
-                            # Copy gradients to CPU
-                            for gpu_p, cpu_p in zip(trainable_params, cpu_params):
-                                if gpu_p.grad is not None:
-                                    cpu_p.grad = gpu_p.grad.to('cpu', non_blocking=True)
-                                    
-                            torch.nn.utils.clip_grad_norm_(cpu_params, 1.0)
-                            optimizer.step()
-                            scheduler.step()
-                            
-                            # Copy updated weights back to GPU/Model
-                            with torch.no_grad():
-                                for gpu_p, cpu_p in zip(trainable_params, cpu_params):
-                                    gpu_p.copy_(cpu_p.to(self.gpu_device, non_blocking=True))
-                            optimizer.zero_grad(set_to_none=True)
-                            self.model.zero_grad(set_to_none=True)
-                        else:
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                            optimizer.step()
-                            scheduler.step()
-                            optimizer.zero_grad(set_to_none=True)
-                            self.model.zero_grad(set_to_none=True)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        self.model.zero_grad(set_to_none=True)
 
                 if step % 20 == 0:
                     loss_val = (loss.item() * accum_steps)
