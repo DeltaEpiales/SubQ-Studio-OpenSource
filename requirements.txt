@@ -1,0 +1,6 @@
+torch
+arxiv
+pypdf
+PyMuPDF
+Pillow
+duckduckgo-search
