@@ -1,6 +1,6 @@
 # SubQ Studio & Harvester 🌌
 
-An end-to-end, open-source pipeline for scraping scientific knowledge (arXiv, PDFs, web search) and training a highly efficient **Subquadratic Sparse Attention (SSA)** language model locally on consumer hardware (e.g., RTX 4070).
+(CURRENTLY PROOF OF CONCEPT/ ROUGH INTEGRATION) An end-to-end, open-source pipeline for scraping scientific knowledge (arXiv, PDFs, web search) and training a highly efficient **Subquadratic Sparse Attention (SSA)** language model locally on consumer hardware (e.g., RTX 4070).
 
 Built specifically to implement methodologies from the **SubQ-1.1-Small** technical report, this project features linear-scaling sparse attention mechanics with Rotary Positional Embeddings (RoPE) for stable long-context reasoning.
 
