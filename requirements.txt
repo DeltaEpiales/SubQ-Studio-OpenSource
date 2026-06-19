@@ -4,3 +4,4 @@ pypdf
 PyMuPDF
 Pillow
 duckduckgo-search
+tiktoken

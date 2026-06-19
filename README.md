@@ -1,8 +1,16 @@
 # SubQ Studio & Harvester 🌌
 
-(CURRENTLY PROOF OF CONCEPT/ ROUGH INTEGRATION) An end-to-end, open-source pipeline for scraping scientific knowledge (arXiv, PDFs, web search) and training a highly efficient **Subquadratic Sparse Attention (SSA)** language model locally on consumer hardware (e.g., RTX 4070).
+An end-to-end, open-source pipeline for scraping scientific knowledge (arXiv, PDFs, web search) and training a highly efficient **Subquadratic Sparse Attention (SSA)** language model locally on consumer hardware (e.g., RTX 4070).
 
 Built specifically to implement methodologies from the **SubQ-1.1-Small** technical report, this project features linear-scaling sparse attention mechanics with Rotary Positional Embeddings (RoPE) for stable long-context reasoning.
+
+## 🚀 v1.1 Production Architecture Update
+The studio has been fully refactored for production-grade throughput! 
+- **Subword BPE Tokenization**: Replaced character-level looping with OpenAI's `tiktoken` (`cl100k_base`), dramatically improving context packing.
+- **Vectorized CUDA Attention**: The pure Python `for`-loop bottleneck in the attention router has been completely eradicated using batched `torch.gather` and Tensor Core operations.
+- **PyTorch 2.0+ Compilation**: Integrated `torch.compile` (`_inductor` backend) for deep kernel-level graph optimization (automatically bypasses Windows Triton limitations).
+- **AMP & CPU Offloading**: Fully integrated Automatic Mixed Precision (FP16/FP32 scaling) paired with Optimizer RAM offloading to maximize RTX 4070 VRAM availability.
+- **Sample-Level Loss Aggregation**: Stabilized long-context gradient dominance by computing loss per-document before batch averaging.
 
 ## Components
 

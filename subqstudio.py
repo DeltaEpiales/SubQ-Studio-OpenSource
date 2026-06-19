@@ -8,41 +8,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+import tiktoken
+
+# Enable maximum hardware acceleration for RTX 40-series Tensor Cores
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # ==========================================
 # 1. TOKENIZER & HARDWARE PROFILING
 # ==========================================
-class CharTokenizer:
+class BPETokenizer:
     def __init__(self):
-        chars = ["<pad>", "<unk>", "<sep>", "\n", " ", "\t"] + [chr(i) for i in range(32, 127)]
-        # Expanded to include common math/science symbols
-        math_symbols = ["∑", "∫", "∂", "∇", "α", "β", "γ", "δ", "θ", "λ", "μ", "π", "σ", "τ", "φ", "ω", "ℏ", "∈", "⊂", "≈", "≠", "≡", "≤", "≥", "∞", "⊗", "⊕"]
-        chars.extend(math_symbols)
-        chars = list(dict.fromkeys(chars)) # Ensure unique deterministically
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for i, ch in enumerate(chars)}
-        self.vocab_size = len(chars)
-        self.unk_id = self.stoi["<unk>"]
+        self.enc = tiktoken.get_encoding("cl100k_base")
+        self.vocab_size = self.enc.n_vocab + 1 # +1 for <sep>
+        self.sep_id = self.enc.n_vocab
         
     def encode(self, s):
         tokens = []
-        i = 0
-        while i < len(s):
-            if s.startswith("<sep>", i):
-                tokens.append(self.stoi["<sep>"])
-                i += 5
-            else:
-                tokens.append(self.stoi.get(s[i], self.unk_id))
-                i += 1
+        parts = s.split("<sep>")
+        for i, part in enumerate(parts):
+            if part:
+                tokens.extend(self.enc.encode(part, allowed_special="all"))
+            if i < len(parts) - 1:
+                tokens.append(self.sep_id)
         return tokens
         
     def decode(self, l):
-        return ''.join([self.itos.get(i, '') for i in l])
+        decoded = ""
+        for t in l:
+            if t == self.sep_id:
+                decoded += "<sep>"
+            else:
+                decoded += self.enc.decode([t])
+        return decoded
 
-tokenizer = CharTokenizer()
+tokenizer = BPETokenizer()
 
 # ==========================================
 # 2. STREAMING DATASET HANDLER
@@ -53,7 +58,7 @@ class ScientificTextDataset(Dataset):
     Streams concatenated text chunks from the data directory. The sequence 
     length determines the context window size during training.
     """
-    def __init__(self, data_dir, seq_length=64):
+    def __init__(self, data_dir, seq_length=64, device='cpu'):
         self.seq_length = seq_length
         self.files = glob.glob(os.path.join(data_dir, "*.txt"))
         self.tokens = []
@@ -68,7 +73,8 @@ class ScientificTextDataset(Dataset):
                 print(f"Skipping {file} due to error: {e}")
 
         # Store as a single contiguous tensor to save memory (much more efficient than a list of tuples)
-        self.tokens = torch.tensor(self.tokens, dtype=torch.long)
+        # Pre-loading directly to the specified device (GPU) eliminates Host-to-Device transfer bottlenecks.
+        self.tokens = torch.tensor(self.tokens, dtype=torch.long, device=device)
         self.num_samples = max(0, len(self.tokens) - seq_length)
 
     def __len__(self):
@@ -139,9 +145,9 @@ class SubquadraticSparseAttention(nn.Module):
         num_blocks = seq_len_padded // self.block_size
         
         # Q, K, V: [B, seq_len_padded, H, D] -> [B, H, seq_len_padded, D]
-        Q = self.q_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.k_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.v_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2)
+        Q = self.q_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        K = self.k_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        V = self.v_proj(x).view(batch_size, seq_len_padded, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
         # Apply RoPE
         Q, K = self.rope(Q, K, seq_len_padded)
@@ -169,35 +175,36 @@ class SubquadraticSparseAttention(nn.Module):
         
         out = torch.zeros_like(Q_blocked) # [B, H, M, B_size, D]
         
-        # Vectorized gather per query block
-        for q_m in range(num_blocks):
-            Q_cur = Q_blocked[:, :, q_m, :, :] # [B, H, B_size, D]
-            
-            sel_blocks = top_k_indices[:, :, q_m, :] # [B, H, K_blocks]
-            
-            # Expand to gather full blocks
-            sel_blocks_exp = sel_blocks.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.block_size, self.head_dim)
-            K_sel = torch.gather(K_blocked, 2, sel_blocks_exp) # [B, H, K_blocks, B_size, D]
-            V_sel = torch.gather(V_blocked, 2, sel_blocks_exp)
-            
-            # Reshape to token-level
-            K_sel = K_sel.view(batch_size, self.num_heads, actual_top_k * self.block_size, self.head_dim)
-            V_sel = V_sel.view(batch_size, self.num_heads, actual_top_k * self.block_size, self.head_dim)
-            
-            # Dense token attention within selected blocks
-            attn_weights = torch.matmul(Q_cur, K_sel.transpose(-1, -2)) / math.sqrt(self.head_dim) # [B, H, B_size, K_blocks * B_size]
-            
-            # Token causal mask
-            q_tok_idx = torch.arange(q_m * self.block_size, (q_m + 1) * self.block_size, device=x.device).unsqueeze(1)
-            
-            base_idx = torch.arange(self.block_size, device=x.device)
-            k_tok_idx = (sel_blocks.unsqueeze(-1) * self.block_size + base_idx).view(batch_size, self.num_heads, -1) # [B, H, K_blocks * B_size]
-            
-            mask = q_tok_idx.view(1, 1, self.block_size, 1) >= k_tok_idx.unsqueeze(2)
-            attn_weights = attn_weights.masked_fill(~mask, float('-inf'))
-            
-            attn_probs = F.softmax(attn_weights, dim=-1)
-            out[:, :, q_m, :, :] = torch.matmul(attn_probs, V_sel)
+        # Fully Vectorized Sparse Block Attention
+        BH = batch_size * self.num_heads
+        
+        # Flatten K and V for vectorized gather
+        K_flat = K_blocked.view(BH, num_blocks, self.block_size * self.head_dim)
+        V_flat = V_blocked.view(BH, num_blocks, self.block_size * self.head_dim)
+        
+        # Gather index setup
+        idx = top_k_indices.view(BH, num_blocks * actual_top_k)
+        idx_gather = idx.unsqueeze(-1).expand(-1, -1, self.block_size * self.head_dim)
+        
+        # Gather selected blocks across all queries simultaneously
+        K_sel = torch.gather(K_flat, 1, idx_gather).view(batch_size, self.num_heads, num_blocks, actual_top_k * self.block_size, self.head_dim)
+        V_sel = torch.gather(V_flat, 1, idx_gather).view(batch_size, self.num_heads, num_blocks, actual_top_k * self.block_size, self.head_dim)
+        
+        # Dense token attention within selected blocks [B, H, M, B_size, K_blocks * B_size]
+        attn_weights = torch.matmul(Q_blocked, K_sel.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        
+        # Vectorized causal mask
+        q_m_idx = torch.arange(num_blocks, device=x.device).unsqueeze(1)
+        base_idx = torch.arange(self.block_size, device=x.device)
+        q_tok_idx = (q_m_idx * self.block_size + base_idx.unsqueeze(0)).unsqueeze(-1) # [M, B_size, 1]
+        
+        k_tok_idx = (top_k_indices.unsqueeze(-1) * self.block_size + base_idx.view(1, 1, 1, 1, -1)).view(batch_size, self.num_heads, num_blocks, actual_top_k * self.block_size)
+        
+        mask = q_tok_idx.unsqueeze(0).unsqueeze(0) >= k_tok_idx.unsqueeze(-2)
+        attn_weights = attn_weights.masked_fill(~mask, float('-inf'))
+        
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        out = torch.matmul(attn_probs, V_sel) # [B, H, M, B_size, D]
 
         out = out.view(batch_size, self.num_heads, seq_len_padded, self.head_dim).transpose(1, 2).contiguous().view(batch_size, seq_len_padded, embed_dim)
         if pad_len > 0: out = out[:, :-pad_len, :]
@@ -256,6 +263,12 @@ class SubQStudioApp:
         
         self.gpu_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = SubQVariantModel(vocab_size=tokenizer.vocab_size).to(self.gpu_device)
+        import sys
+        if torch.cuda.is_available() and sys.platform != "win32":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+            except Exception as e:
+                print(f"Skipping torch.compile: {e}")
         self.is_training = False
         self.save_dir = "./subq_models"
         self.data_dir = "./science_data"
@@ -397,6 +410,10 @@ class SubQStudioApp:
         self.batch_size_var = tk.IntVar(value=16)
         ttk.Entry(batch_row, textvariable=self.batch_size_var, width=5).pack(side=tk.LEFT, padx=5)
         
+        ttk.Label(batch_row, text="Grad Accumulation:").pack(side=tk.LEFT, padx=10)
+        self.grad_accum_var = tk.IntVar(value=4)
+        ttk.Entry(batch_row, textvariable=self.grad_accum_var, width=4).pack(side=tk.LEFT)
+        
         ttk.Label(batch_row, text="Epochs:").pack(side=tk.LEFT, padx=10)
         self.epochs_var = tk.IntVar(value=10)
         ttk.Entry(batch_row, textvariable=self.epochs_var, width=5).pack(side=tk.LEFT)
@@ -425,9 +442,9 @@ class SubQStudioApp:
         self.best_loss = float('inf')
         
         # 1. Prepare Streaming Dataset
-        # Increased seq_length to 512 so that num_blocks (16) > top_k_blocks (4).
-        # This forces the routing network to actually learn to select blocks.
-        dataset = ScientificTextDataset(self.data_dir, seq_length=512)
+        # Pre-load entire dataset directly into VRAM for zero-latency batch generation
+        # This completely eliminates CPU->GPU transfer bottlenecks.
+        dataset = ScientificTextDataset(self.data_dir, seq_length=512, device=self.gpu_device)
         if len(dataset) == 0:
             self.log(self.train_log, "[Error] Database empty. Cannot initialize DataLoader.")
             self.btn_train.config(state=tk.NORMAL)
@@ -435,13 +452,13 @@ class SubQStudioApp:
             return
 
         # DataLoader configured for GPU Starvation Prevention
-        # pin_memory=True locks the RAM, num_workers allows parallel CPU fetching
+        # With dataset already in VRAM, pin_memory and num_workers are unnecessary.
         dataloader = DataLoader(
             dataset, 
             batch_size=self.batch_size_var.get(), 
             shuffle=True, 
-            pin_memory=torch.cuda.is_available(), 
-            num_workers=0, # Set to 2 or 4 if using a Linux machine, Windows often prefers 0 for Tkinter stability
+            pin_memory=False, 
+            num_workers=0,
             drop_last=True
         )
 
@@ -469,97 +486,110 @@ class SubQStudioApp:
         else:
             self.log(self.train_log, "[Compute] Standard precision (FP32) active. CUDA not available for AMP.")
 
-        self.model.train()
+        accum_steps = max(1, self.grad_accum_var.get())
         epochs = self.epochs_var.get()
+        total_steps = (len(dataloader) // accum_steps) * epochs
+        warmup_steps = max(1, int(total_steps * 0.1)) # 10% warmup
+        
+        scheduler1 = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+        scheduler2 = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6)
+        scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_steps])
+
+        self.model.train()
         
         for epoch in range(epochs):
             if not self.is_training: break
             
+            optimizer.zero_grad(set_to_none=True)
+            self.model.zero_grad(set_to_none=True)
+            
             for step, (x_batch, y_batch) in enumerate(dataloader):
                 if not self.is_training: break
                 
-                # non_blocking=True allows the GPU to compute while CPU moves the next batch
-                x_batch = x_batch.to(self.gpu_device, non_blocking=True)
-                y_batch = y_batch.to(self.gpu_device, non_blocking=True)
-                
-                optimizer.zero_grad(set_to_none=True) # Clears CPU gradients if offloading
-                self.model.zero_grad(set_to_none=True) # CRITICAL FIX: Clear GPU gradients!
+                # Batches are already generated natively on the GPU by the VRAM-resident Dataset
+                # No host-to-device .to() transfer is needed!
                 
                 # Forward Pass (with optional Tensor Core acceleration)
                 if amp_enabled:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
                         logits = self.model(x_batch)
-                        # Sample-level loss aggregation (SubQ-1.1-Small paper)
-                        loss_unreduced = F.cross_entropy(logits.transpose(1, 2), y_batch, reduction='none')
-                        loss = loss_unreduced.mean(dim=1).mean()
+                        # Sample-level loss aggregation (from SubQ-1.1-Small Technical Report)
+                        # Averages loss per sample first to prevent long documents from dominating gradients
+                        B, T, V = logits.shape
+                        loss_per_token = F.cross_entropy(logits.view(-1, V), y_batch.view(-1), reduction='none').view(B, T)
+                        loss_per_sample = loss_per_token.mean(dim=1)
+                        loss = loss_per_sample.mean() / accum_steps
                     
                     # Scaled Backward Pass
                     scaler.scale(loss).backward()
                     
-                    if use_cpu_offload:
-                        inv_scale = 1. / scaler.get_scale()
-                        
-                        # Validate gradients before copying to RAM
-                        has_inf = False
-                        for gpu_p in trainable_params:
-                            if gpu_p.grad is not None:
-                                if torch.isinf(gpu_p.grad).any() or torch.isnan(gpu_p.grad).any():
-                                    has_inf = True
-                                    break
-                                    
-                        if has_inf:
-                            scaler.update() # drop step and scale down
-                        else:
-                            # Copy gradients to RAM safely
+                    if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+                        if use_cpu_offload:
+                            # 1. Copy SCALED gradients to RAM
                             for gpu_p, cpu_p in zip(trainable_params, cpu_params):
                                 if gpu_p.grad is not None:
-                                    cpu_p.grad = (gpu_p.grad.to('cpu', non_blocking=True) * inv_scale)
+                                    cpu_p.grad = gpu_p.grad.to('cpu', non_blocking=True)
                             
+                            # 2. Unscale CPU gradients and Step using PyTorch AMP
+                            scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(cpu_params, 1.0)
-                            optimizer.step()
+                            scaler.step(optimizer)
                             scaler.update()
+                            scheduler.step()
                             
-                            # Copy weights back to 4070
+                            # 3. Copy updated weights back to GPU
                             with torch.no_grad():
                                 for gpu_p, cpu_p in zip(trainable_params, cpu_params):
                                     gpu_p.copy_(cpu_p.to(self.gpu_device, non_blocking=True))
-                    else:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            self.model.zero_grad(set_to_none=True)
+                        else:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                            scaler.step(optimizer)
+                            scaler.update()
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            self.model.zero_grad(set_to_none=True)
 
                 else:
                     logits = self.model(x_batch)
                     # Sample-level loss aggregation (SubQ-1.1-Small paper)
                     loss_unreduced = F.cross_entropy(logits.transpose(1, 2), y_batch, reduction='none')
-                    loss = loss_unreduced.mean(dim=1).mean()
+                    loss = loss_unreduced.mean(dim=1).mean() / accum_steps
                     loss.backward()
                     
-                    if use_cpu_offload:
-                        # Copy gradients to CPU
-                        for gpu_p, cpu_p in zip(trainable_params, cpu_params):
-                            if gpu_p.grad is not None:
-                                cpu_p.grad = gpu_p.grad.to('cpu', non_blocking=True)
-                                
-                        torch.nn.utils.clip_grad_norm_(cpu_params, 1.0)
-                        optimizer.step()
-                        
-                        # Copy updated weights back to GPU/Model
-                        with torch.no_grad():
+                    if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+                        if use_cpu_offload:
+                            # Copy gradients to CPU
                             for gpu_p, cpu_p in zip(trainable_params, cpu_params):
-                                gpu_p.copy_(cpu_p.to(self.gpu_device, non_blocking=True))
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        optimizer.step()
+                                if gpu_p.grad is not None:
+                                    cpu_p.grad = gpu_p.grad.to('cpu', non_blocking=True)
+                                    
+                            torch.nn.utils.clip_grad_norm_(cpu_params, 1.0)
+                            optimizer.step()
+                            scheduler.step()
+                            
+                            # Copy updated weights back to GPU/Model
+                            with torch.no_grad():
+                                for gpu_p, cpu_p in zip(trainable_params, cpu_params):
+                                    gpu_p.copy_(cpu_p.to(self.gpu_device, non_blocking=True))
+                            optimizer.zero_grad(set_to_none=True)
+                            self.model.zero_grad(set_to_none=True)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                            optimizer.step()
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            self.model.zero_grad(set_to_none=True)
 
                 if step % 20 == 0:
-                    loss_val = loss.item()
+                    loss_val = (loss.item() * accum_steps)
                     atl_msg = ""
                     if loss_val < self.best_loss:
                         self.best_loss = loss_val
                         atl_msg = " (⭐ All-Time Low!)"
-                    self.log(self.train_log, f"Epoch {epoch+1}/{epochs} | Step {step} | Loss: {loss_val:.4f}{atl_msg}")
+                    self.log(self.train_log, f"Epoch {epoch+1}/{epochs} | Step {step} | Loss: {loss_val:.4f}{atl_msg} | LR: {scheduler.get_last_lr()[0]:.2e}")
                     
         self.log(self.train_log, "--- Pipeline Run Concluded ---")
         save_path = os.path.join(self.save_dir, f"subq_science_{int(time.time())}.pt")
